@@ -1,0 +1,104 @@
+#ifndef __TYPE_H
+#define __TYPE_H
+
+#include "stm32f0xx.h"	
+#include "Sys_cfg.h"
+#include "os.h"
+
+#define ECHO_ENABLE 	        0
+#define ECHO_DISABLE 	        1
+
+#define FLASH_WR_ENABLE         1
+#define FLASH_WR_DISABLE        0
+
+typedef struct 
+{
+  u8 SlaveAddr;
+  u8 BaudRate;
+  u8 WordLength;
+  u8 StopBits;
+  u8 Parity;
+  u8 Echo;
+}UartCommTypeDef;
+
+typedef struct
+{
+  u16 DACode[8];
+  u16 Scale[8];
+}FloaterCalibTypeDef;
+
+typedef struct
+{
+  u32 CapMin;
+  u32 CapMax;
+  float DAMin;
+  float DAMax;
+  float Def_Range;
+  float Def_CapMin;
+  float Def_CapMax;
+  
+  float Temp_K;
+  float Temp_B;
+  float Temp2_K;
+  float Temp2_B;
+  float LiquitHeightforDAMax;
+  
+  u8 AutoUpLoadTime;
+  u8 CompenEn;
+  //u8 OutputUnit;
+  u8 bFlashWEn;
+  u8 LiquidAlarm;
+  u8 FuelType;
+  u8 BoxShape;
+  u16 BoxPara[4];
+  u16 AddLiqTime;
+  u16 SubLiqTime;
+  u16 AddLiqCnt;
+  u16 RestLiqCnt;
+  u16 SubLiqCnt;
+  u16 CalibTemp;
+  u32 OilRange;
+  FloaterCalibTypeDef Floater;
+}ProductParaTypeDef;
+
+typedef enum 
+{
+  Def_State = 0x00,
+  CalibrateLow = 0x01,
+  CalibrateHeight = 0x02,
+  Calibrated = 0x03,
+}CalState_TypeDef;
+
+typedef struct
+{
+  u8 OilInit;
+  u8 AccStatus;
+  u16 CarSpeed;
+  u16 DAForFloater;
+  u32 CarMileage;
+  u32 CapFromPCap;
+  u32 RawCap;
+  u32 RawCapBak;
+  u32 LiquidHeightValue[2];
+  
+  float HeightBak;
+  float LiquidHeight[2];
+  float LiquidHeightRate[2];
+  float TempInSensor;
+  float TempInAir;
+  
+  CalState_TypeDef CalState;
+  OS_TICK uartInitTime;
+  BitAction bInitializing;
+}RunVarTypeDef;
+
+typedef struct
+{
+  u8 FilterLevel;
+  u16 FilterCycle;
+  float UserFlowK;
+  float UserFlowB;
+}UserParamTypeDef;
+
+#endif
+
