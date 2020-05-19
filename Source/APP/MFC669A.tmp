@@ -1,0 +1,1765 @@
+#include "BSP.h"
+
+#define BUFLEN100MS  10                                                         //100ms更新数组大小
+#define BUFLEN1S     10                                                         //1s更新数组大小
+#define BUFLEN10S    150                                                        //10s更新数组大小
+
+//u8 AccFlag;                                                                     //ACC标志
+u8 Oil_Level_Exc;                                                               //液位变化异常统计  
+u8 OilFresh1s;                                                                  //油量每秒更新标志
+u8 FiltStart;                                                                   //滤波开始标志
+u8 OilVarCmpCnt;                                                                //液位比较时间计数器
+u8 FilterFresh1s;                                                               //滤波电容每秒更新标志
+u8 OilEventFlag;                                                                //油量事件
+u8 Oil_NextAdd_Flag;                                                            //二次加油状态  0:一次加油  1：二次加油
+u8 Oil_Analyze_Start;                                                           //油量分析开始标志
+u8 PCapVarGraphCycle;                                                           //液位变化曲线周期
+s8 PCapVarGraph[10];                                                            //液位变化曲线点
+u8 PCapStableCnt[3];                                                            //液位稳定时间计数
+
+u8 Oil_Exc_Shake;                                                               //油位异常波动标志
+u8 Oil_Temp_Dir;                                                                //油位临时变化方向
+u8 Oil_Level_Cnt;                                                               //液位比较次数
+
+u16 g_cyRange;                                                                  //油杆长度
+u16 OilEventWaitOut;                                                            //油量事件输出标志
+u16 Oil_NextAdd_Time;                                                           //二次加油超时器
+  
+u32 g_cyTankOil;                                                                //油箱实时油量
+u32 f_cyTankOil;                                                                //油箱滤波油量
+u32 L_cyTankOil;                                                                //上次实时油量值
+u32 Oil_Vary_Inc;                                                               //油量增加量 用来计算
+u32 Oil_Vary_Sub;                                                               //油量减少量 用来计算
+u32 Oil_Calcu_Inc;                                                              //油量增加累计 用来存储
+u32 Oil_Calcu_Sub;                                                              //油量减少累计 用来存储
+u32 OilAddEndRecord;                                                            //加油结束点存储
+u32 LiqVarBuf[5];                                                               //油量缓冲器
+u32 Oil5sfTank[5];                                                              //平滑后取每5s点油量
+u32 OilLast5sValue;                                                             //上一个5s油量值
+
+u32 CapRange;                                                                   //电容量程
+u32 FilterCapValue;                                                             //滤波电容值
+u32 RealTimeCapValue;                                                           //每秒电容值
+u32 PCapStableBuf[BUFLEN10S];                                                   //电容稳定值数组
+u32 PCapRealTimeBuf[BUFLEN100MS];                                               //电容实时值数组
+
+u32 Oil_UpValue_Min;                                                            //油量上升量阈值
+u32 Oil_DnValue_Min;                                                            //油量下降量阈值
+
+u32 UserOilUpOneTime;                                                           //用户设置一次油量上升量
+u32 UserOilDnOneTime;                                                           //用户设置一次油量下降量
+
+float UserOilUpRate;                                                           //用户设置油量上升斜率
+float UserOilDnRate;                                                           //用户设置油量下降斜率
+
+extern u8 OilAlarmCnt;                                                         //统计油量报警次数
+extern u8 OilDataKeepTime;                                                     //油量数据保持时间
+extern u32 Oil_Add_Output;                                                     //输出加油量
+extern u32 Oil_Sub_Output;                                                     //输出漏油量(总漏油量输出)
+
+extern u32 Oil_Sub_PreOutput;                                                  //临时漏油量输出(用于在漏油的过程中报警)
+extern u8 Oil_Sub_PreFlag;                                                     //显示临时漏油标志
+
+extern u32 Oil_NextAdd_Start;                                                  //二次加油起始点
+
+void TIM3_IRQHandler(void)
+{
+    OS_ERR Err;
+    OSIntEnter();   
+    
+    if (RESET != TIM_GetITStatus(TIM3, TIM_IT_Update))
+    {
+      OilVarCmpCnt++;
+      if((INIT_FLAG <= OilDataKeepTime) && (OIL_DATA_TIMEOUT > OilDataKeepTime))
+      {
+        OilDataKeepTime++;
+      }
+      if(OIL_DATA_TIMEOUT <= OilDataKeepTime)
+      {
+        OilDataKeepTime = DATA_CLEAR;
+      }
+        //if((PCap_Res_Stau() & 0x100000) && (Bit_SET == PCap_Ready))
+        TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
+        if(PCap_Res_Stau() & 0x100000)
+        {
+            //PCap_Ready = Bit_RESET;
+            
+            RunVar.RawCap = PCap_Res_Value();
+            PCap_MEASURE();
+            
+            OSTaskSemPost(&AppFilterTCB, OS_OPT_POST_NONE, &Err);
+        }
+	
+    }
+
+    OSIntExit();   
+}
+
+void Timer3_Init(void)
+{
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+    TIM_TimeBaseInitTypeDef TIM_TimeBaseInitStruct;
+    TIM_TimeBaseInitStruct.TIM_ClockDivision = TIM_CKD_DIV1;
+    TIM_TimeBaseInitStruct.TIM_CounterMode = TIM_CounterMode_Up;
+    TIM_TimeBaseInitStruct.TIM_Period = 999;
+    TIM_TimeBaseInitStruct.TIM_Prescaler = 4799;
+    TIM_TimeBaseInitStruct.TIM_RepetitionCounter = 0;
+    TIM_TimeBaseInit(TIM3, &TIM_TimeBaseInitStruct);
+    TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
+
+    NVIC_InitTypeDef NVIC_InitStruct;
+    NVIC_InitStruct.NVIC_IRQChannel = TIM3_IRQn;
+    NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_InitStruct.NVIC_IRQChannelPriority = 0;
+    NVIC_Init(&NVIC_InitStruct);
+
+    BSP_IntVectSet(BSP_INT_ID_TIM3, TIM3_IRQHandler);
+
+    TIM_SetCounter(TIM3, 0);
+    TIM_ClearITPendingBit(TIM3, TIM_IT_Update);
+    TIM_ITConfig(TIM3, TIM_IT_Update, ENABLE);
+    TIM_Cmd(TIM3, ENABLE);
+}
+
+void Pcap_INTN(void)
+{
+    EXTI_InitTypeDef   EXTI_InitStructure;
+    GPIO_InitTypeDef   GPIO_InitStructure;
+    NVIC_InitTypeDef   NVIC_InitStructure;
+    
+    BSP_IntVectSet(BSP_INT_ID_EXTI4_15, EXTI4_15_IRQHandler);
+    
+    /* Enable GPIOA clock */
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_GPIOB, ENABLE);
+
+    /* Configure PA6 pins as input floating */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN;
+    GPIO_InitStructure.GPIO_PuPd = GPIO_PuPd_NOPULL;
+    GPIO_Init(GPIOB, &GPIO_InitStructure);
+
+    /* Enable SYSCFG clock */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_SYSCFG, ENABLE);
+
+    /* Connect EXTI6 Line to PA6 pin */
+    SYSCFG_EXTILineConfig(EXTI_PortSourceGPIOB, EXTI_PinSource10);
+
+    /* Configure EXTI6line */
+    EXTI_InitStructure.EXTI_Line = EXTI_Line10;
+    EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
+    EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Rising;
+    EXTI_InitStructure.EXTI_LineCmd = ENABLE;
+    EXTI_Init(&EXTI_InitStructure);
+
+    /* Enable and set EXTI4_15 Interrupt */
+    NVIC_InitStructure.NVIC_IRQChannel = EXTI4_15_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPriority = 3;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+}
+
+void Capture_TimerInit(void)
+{
+    Timer3_Init();
+}
+
+
+
+u16 CalcuFloaterDACode(u16 usRate, FloaterCalibTypeDef *pFcal)
+{
+    u32 i = 0;
+    u32 head, tail;
+    u32 u32Temp;
+    //find the first num that larger than usRate
+    for(i = 0; i < 8; i++)
+    {
+        if(usRate <= pFcal->Scale[i])
+            break;
+    }
+
+    if(i == 0)  // the first data is larger than usRate
+    {
+        return pFcal->DACode[0];
+    }
+    else if(i == 8) //no any data can find
+    {
+        head = 6;
+        tail = 7;
+    }
+    else
+    {
+        head = i - 1;
+        tail = i;
+    }
+
+    /*
+       usRate - pFcal->Scale[head]      pFcal->Scale[tail]  - pFcal->Scale[head]
+      ---------------------------- = -------------------------------------------
+        x - pFcal->DACode[head]         pFcal->DACode[tail] - pFcal->DACode[head]
+       */
+
+    u32Temp = (usRate - pFcal->Scale[head]);
+    u32Temp *= (pFcal->DACode[tail] - pFcal->DACode[head]);
+    u32Temp /= (pFcal->Scale[tail]  - pFcal->Scale[head]);
+    u32Temp += pFcal->DACode[head];
+
+    return((u16)u32Temp);
+}
+
+BitAction IsNeetResetPcap(void)
+{
+    //static unsigned char ucHeightEqualCnt = 0;
+    static unsigned char ucRawCapEqualCnt = 0;
+    BitAction bErrHappen = Bit_RESET;
+
+    if(RunVar.RawCapBak == 0xffffffff)
+    {
+        RunVar.RawCapBak = RunVar.RawCap + 1;
+    }
+
+    if(RunVar.RawCapBak != RunVar.RawCap)
+    {
+        ucRawCapEqualCnt = 0;
+    }
+    else
+    {
+        ucRawCapEqualCnt += 1;
+    }
+
+    RunVar.RawCapBak = RunVar.RawCap;
+
+    if(ucRawCapEqualCnt >= 10)
+    {
+        ucRawCapEqualCnt = 0;
+        bErrHappen = Bit_SET;
+    }
+
+                /*
+    if((RunVar.RawCap <= ProductPara.CapMax) && (RunVar.RawCap >= ProductPara.CapMin))
+    {
+        if((RunVar.HeightBak > 500000.4) && (RunVar.HeightBak < 500000.6))
+        {
+            RunVar.HeightBak = RunVar.LiquidHeight + 1.1;
+        }
+
+        if(RunVar.HeightBak != RunVar.LiquidHeight)
+        {
+            ucHeightEqualCnt = 0;
+        }
+        else
+        {
+            ucHeightEqualCnt += 1;
+        }
+
+        RunVar.HeightBak = RunVar.LiquidHeight;
+
+        if(ucHeightEqualCnt >= 250)
+        {
+            ucHeightEqualCnt = 0;
+            bErrHappen = Bit_SET;
+        }
+    }
+    else
+    {
+        ucHeightEqualCnt = 0;
+    }*/
+
+    return bErrHappen;
+}
+
+#if 0
+
+#define ONESECONDSAMCNT  10
+#define DAFILTERSECCNT  20
+
+short sSamQuePerSec[ONESECONDSAMCNT];
+short sDAQueInSec[DAFILTERSECCNT];
+
+unsigned short DAOutPutFilter(short sDACIn)
+{
+    static BitAction bInitFilter = Bit_RESET;
+    static unsigned short PerSecondIndex;
+    static unsigned short SecondIndex;
+    static short OutputValue;
+    static short Outputbak;
+    
+    long slTemp;
+    unsigned long i = 0;
+
+    //initate filter queue, do only one time
+    if(Bit_RESET == bInitFilter)
+    {
+        bInitFilter = Bit_SET;
+        
+        PerSecondIndex = 0;
+        for(i = 0; i < ONESECONDSAMCNT; i++)
+        {
+            sSamQuePerSec[i] = sDACIn;
+        }
+        
+        SecondIndex = 0;
+        for(i = 0; i < DAFILTERSECCNT; i++)
+        {
+            sDAQueInSec[i] = sDACIn;
+        }
+
+        OutputValue = sDACIn;
+        Outputbak = sDACIn;
+    }
+
+    //when liquid height is change largly, reset the filter ,let the da output follow the situation.
+    
+    //put new data in the queue
+    sSamQuePerSec[PerSecondIndex++] = sDACIn;
+    
+    if(PerSecondIndex >= ONESECONDSAMCNT)
+    {
+        PerSecondIndex = 0;
+        
+        slTemp = 0;
+        for(i = 0; i < ONESECONDSAMCNT; i++)
+        {
+            slTemp += sSamQuePerSec[i];
+        }
+        slTemp /= ONESECONDSAMCNT;
+
+        sDAQueInSec[SecondIndex++] = slTemp;
+        if(SecondIndex >= DAFILTERSECCNT)
+            SecondIndex = 0;
+
+        slTemp = 0;
+        for(i = 0; i < DAFILTERSECCNT; i++)
+        {
+            slTemp += sDAQueInSec[i];
+        }
+        slTemp /= DAFILTERSECCNT;
+        
+        OutputValue = slTemp;
+
+        if(abs(Outputbak - OutputValue) > 3)
+        {
+            Outputbak = OutputValue;
+        }
+    }
+    
+    return (unsigned short)Outputbak;
+}
+
+#endif
+
+#define ADTIMEINTERVAL 100
+
+u16 DAOutPutStabilised(u16 usRate, u16 usDACOutput)
+{
+    static u16 usBaseRate = 0xffff;
+    static u16 usDABak;
+    static u8 ucDirBak = 0;     //0表示相等，1表示变小，2表示增大
+    static u16 usLargeThan5PercCnt = 0;
+    static u16 usLargeThan1PercCnt = 0;
+
+    u16 usRateDelta;
+    u8 ucDir;
+
+    //第一次运行的时候获取一个油量比率
+    if (usBaseRate > 101)    //由于usRate是浮点转换过来，有误差，所以增加1
+    {
+        usBaseRate = usRate;
+        usDABak = usDACOutput;
+        ucDirBak = 0;
+        usLargeThan5PercCnt = 0;
+        usLargeThan1PercCnt = 0;
+        
+        return usDABak;
+    }
+
+    if(usBaseRate == usRate)
+    {
+        ucDirBak = 0;
+        usLargeThan5PercCnt = 0;
+        usLargeThan1PercCnt = 0;
+        
+        return usDABak;
+    }
+    else if(usBaseRate > usRate)
+    {
+        ucDir = 1;
+        usRateDelta = usBaseRate - usRate;
+    }
+    else
+    {
+        ucDir = 2;
+        usRateDelta = usRate - usBaseRate;
+    }
+
+    //当方向改变，不会改变输出，也不会改变判断的基准
+    if(ucDir != ucDirBak)
+    {
+        ucDirBak = ucDir;
+        usLargeThan5PercCnt = 0;
+        usLargeThan1PercCnt = 0;
+        
+        return usDABak;
+    }
+    else
+    {
+        usLargeThan5PercCnt = (usRateDelta > 5) ? (usLargeThan5PercCnt + 1) : 0;
+
+        usLargeThan1PercCnt = (usRateDelta > 1) ? (usLargeThan1PercCnt + 1) : 0;
+
+        if((usLargeThan1PercCnt > (5000/ADTIMEINTERVAL)) || (usLargeThan5PercCnt > (6000/ADTIMEINTERVAL)))
+        {
+            usBaseRate = usRate;
+            usDABak = usDACOutput;
+            //ucDirBak = 0;
+            usLargeThan5PercCnt = 0;
+            usLargeThan1PercCnt = 0;
+            
+            return usDACOutput;
+        }
+        else
+        {
+            return usDABak;
+        }
+    }
+}
+
+
+
+//**************************************************************************************************
+// 名称         	: LiquidVariaAnalysis()
+// 创建日期     	: 2016-10-10
+// 作者        	 	: 庄明群
+// 功能         	: 加漏油量功能处理
+// 输入参数     	: 无
+// 输出参数     	: 无
+// 返回结果     	: 无
+// 注意和说明   	:
+// 修改内容     	:
+//**************************************************************************************************
+
+void LiquidVariaAnalysis(void)
+{
+    u8 i, j;
+    s32 Oil_Vary_Value;                                                           //油量变化值
+    u32 Oil_Vary_Valabs;                                                          //油量变化绝对值
+    u32 Oil_Calcu_Average;                                                        //油量平均值    
+    
+    float Oil_Vary_Rate;                                                         //油量变化斜率
+    
+    static u8 Oil_Level_Dir;                                                     //液位变化方向
+    static u8 Oil_Last_Status;                                                   //液位上次状态
+    static u8 Oil_Shake_Dir;                                                     //液位抖动方向
+    static u16 Oil_Run_Cnt;                                                      //运行次数
+    static u16 Oil_Blance_Cnt;                                                   //液位平衡不变计数
+    static u16 Oil_Shake_Cnt;                                                    //液位抖动计数
+    static u16 Oil_Up_SecCnt;                                                    //油量增加次数
+    static u16 Oil_Dn_SecCnt;                                                    //油量下降次数
+    static u16 Oil_Stable_Cnt;                                                   //液位稳定计数
+    static u32 Oil_Vary_Start;                                                   //油量开始点
+    static u32 Oil_Vary_End;                                                     //油量结束点
+    static u32 Oil_Reach_Low;                                                    //油量低位点
+    static u32 Oil_Reach_Hih;                                                    //油量高位点
+    static u32 Oil_Filter_Start;                                                 //滤波油量起始点
+
+    //系统油量分析还没开始就设置开始标志
+    if((Oil_Analyze_Start & INIT_FLAG) == 0)
+    {
+        //对油量运行过程的时间计数 单位为秒
+        Oil_Run_Cnt = 0;
+        OilEventWaitOut = 0;
+        Oil_NextAdd_Flag = 0;
+        RunVar.FiltSpeed = 0;
+        L_cyTankOil = g_cyTankOil;
+        Oil_Analyze_Start = INIT_FLAG;
+    }
+  
+    if(Oil_Run_Cnt == 0)
+    {
+        Oil_Level_Cnt = 0;
+        Oil_Level_Exc = 0;
+        Oil_Level_Dir = 0;
+        Oil_Shake_Dir = 0;
+        Oil_Up_SecCnt = 0;
+        Oil_Dn_SecCnt = 0;             
+        Oil_Shake_Cnt = 0;
+        Oil_Blance_Cnt = 0;
+        Oil_Stable_Cnt = 0;
+        Oil_Last_Status = 0;
+
+        Oil_Vary_Inc = 0;
+        Oil_Vary_Sub = 0;
+        Oil_Temp_Dir = 0;
+
+        Oil_Vary_Start = g_cyTankOil;
+        Oil_Vary_End = g_cyTankOil;
+        Oil_Reach_Low = g_cyTankOil;
+        Oil_Reach_Hih = g_cyTankOil;
+        OilLast5sValue = g_cyTankOil;
+        Oil_Filter_Start = f_cyTankOil;
+        //油量变化极限报警 超过极限优先判断而产生报警
+        ProductPara.Oil_Add_Alarm = ProductPara.OilRange * 2 / 5;//量程的40%
+        
+        for(i = 0; i < 5; i++)
+        {
+            LiqVarBuf[i] = g_cyTankOil;        //把缓冲区置实时值
+            Oil5sfTank[i] = f_cyTankOil;       
+        }
+    }
+  
+    //如果有ACC 加漏油阈值翻倍
+    if((RunVar.AccStatus == ACC_ON) || (RunVar.AccStatus == ACC_OFF))                                                      //车机是否给传感器ACC信号                                                                             
+    {
+        if(RunVar.AccStatus == ACC_ON)                                             //ACC开启
+        {
+            if(RunVar.CarSpeed <= 5)                                               //判断速度，小于等于5KM/H  
+            {
+                Oil_UpValue_Min = (u32)(1.5f * ProductPara.AddLiqCnt);             //油量上升阈值为设定加油阈值的1.5倍
+                Oil_DnValue_Min = (u32)(1.5f * ProductPara.SubLiqCnt);             //油量下降阈值为设定加油阈值的1.5倍
+            }
+            else    //大于5KM/H  2倍
+            {
+                Oil_UpValue_Min = (u32)(2.2f * ProductPara.AddLiqCnt);            //大于5km/h，说明车在运动，提高阈值
+                Oil_DnValue_Min = (u32)(2.2f * ProductPara.SubLiqCnt);
+            }                          
+        }
+        else                                                                       //ACC关闭，说明车停止
+        {
+            //单倍加油量阈值
+            Oil_UpValue_Min = ProductPara.AddLiqCnt;                                  //为单倍加油量阈值
+            //单倍漏油量阈值
+            Oil_DnValue_Min = ProductPara.SubLiqCnt;                                  
+        }
+    }
+    else                                                                          //如果没有ACC 判断速度                                            
+    {
+        //速度大于0 加漏油阈值翻倍
+        if(RunVar.CarSpeed > 0)                                                                         
+        {
+            if(RunVar.CarSpeed <= 5)                                                //小于等于5KM/H  1.5倍               
+            {
+                Oil_UpValue_Min = (u32)(1.5f * ProductPara.AddLiqCnt);
+                Oil_DnValue_Min = (u32)(1.5f * ProductPara.SubLiqCnt);
+            }
+            else    //大于5KM/H  2倍
+            {
+                Oil_UpValue_Min = (u32)(2.2f * ProductPara.AddLiqCnt);
+                Oil_DnValue_Min = (u32)(2.2f * ProductPara.SubLiqCnt);
+            }
+        }
+        else//速度为0
+        {
+            Oil_UpValue_Min = ProductPara.AddLiqCnt;
+            Oil_DnValue_Min = ProductPara.SubLiqCnt;
+        }
+    }
+    //用户设置的油量上升斜率
+    UserOilUpRate = (float)Oil_UpValue_Min / (float)ProductPara.AddLiqTime;      //设置加漏油时间，可以设置油量上升率阈值 
+    //用户设置的一次比较油量上升量                                                //在比较时间内油量的上升量
+    UserOilUpOneTime = (u32)(UserOilUpRate * ProductPara.LiquidCmpTc);
+    //用户设置的油量下降斜率
+    UserOilDnRate = (float)Oil_DnValue_Min / (float)ProductPara.SubLiqTime;
+    //用户设置的一次比较油量下降量                                                //在比较时间内油量的下降量                                        
+    UserOilDnOneTime = (u32)(UserOilDnRate * ProductPara.LiquidCmpTc);   
+
+    //uprintf("Oil_UpValue_Min=%d\r\n",Oil_UpValue_Min);
+    //uprintf("Oil_DnValue_Min=%d\r\n",Oil_DnValue_Min);
+    
+    if(OilVarCmpCnt > CNT_MAX)            //OilVarCmpCnt在tim3中每100ms加1，此处表示1s
+    {
+        Oil_Run_Cnt++;                     //1s计数一次
+        
+        OilVarCmpCnt = 0;                       
+
+        //二次加油时间倒计时
+        if(Oil_NextAdd_Flag > 0)                                                                               
+        {
+            Oil_NextAdd_Time++;
+        }
+        //二次加油倒计时结束 恢复正常加油阈值
+        if(Oil_NextAdd_Time > OIL_NEXTADD_TIMEOUT)                                                                          
+        {
+            Oil_NextAdd_Time = 0;
+            Oil_NextAdd_Flag = 0;
+        }
+        
+        //加漏油事件时间溢出则输出加漏油
+        if(OilEventWaitOut >= OIL_EVENT_WAIT)                                                                             
+        {
+            OilEventWaitOut++;
+        }
+
+        if(!(Oil_Run_Cnt % 5))                       //每5S更新一个数据
+        {
+            for(i = 0; i < 4; i++)
+            {
+                Oil5sfTank[i] = Oil5sfTank[i + 1];
+            }
+            Oil5sfTank[4] = f_cyTankOil;             //先进先出，滤波值放在队尾
+        }
+
+        for(i = 0; i < 4; i++)                      //每秒更新一个值
+        {
+            LiqVarBuf[i] = LiqVarBuf[i + 1];
+        }       
+        LiqVarBuf[4] = g_cyTankOil;                 //实时值放在队尾
+
+        Oil_Exc_Shake = 0;
+
+        for(i = 0; i < 4; i++)
+        {
+            for(j = i + 1; j < 5; j++)
+            {
+                if((LiqVarBuf[j] - LiqVarBuf[i]) >= 50)
+                {
+                    Oil_Exc_Shake |= 0x01;              //后面的值大于前面的，上升
+                }
+                else if((LiqVarBuf[i] - LiqVarBuf[j]) >= 50)
+                {
+                    Oil_Exc_Shake |= 0x10;              //前面的值大于后面的，下降
+                }
+            }
+            if(Oil_Exc_Shake == 0x11)
+            {
+                break;//上下波动退出
+            }
+        }
+              
+        Oil_Calcu_Average = 0;
+        
+        for(i = 0; i < 5; i++)
+        {
+            Oil_Calcu_Average += LiqVarBuf[i];
+        }
+        Oil_Calcu_Average /= 5;                                        
+
+        //抖动次数小于2次将实时油量值覆盖平均值
+        if(Oil_Shake_Cnt < OIL_SHAKE_MAX) 
+        {
+            Oil_Calcu_Average = g_cyTankOil;
+        }       
+        
+        //油量达到低点
+        if(Oil_Calcu_Average < Oil_Reach_Low)   //寻找油量最低点
+        {
+            Oil_Reach_Low = Oil_Calcu_Average;
+
+            Oil_Temp_Dir |= OIL_SHAKE_DN;       //变化方向向下
+
+            //if((Oil_Reach_Hih > Oil_Vary_Start)&&((Oil_Reach_Hih - Oil_Vary_Start) > 8))
+            if(Oil_Reach_Hih - Oil_Vary_Start > 8)//为什么？
+            {
+                Oil_Temp_Dir |= INIT_FLAG;
+            }
+
+            Oil_Filter_Start = 0;
+
+            for(i = 0; i < 5; i++)
+            {
+                Oil_Filter_Start += Oil5sfTank[i];
+            }
+
+            Oil_Filter_Start /= 5;   //得到一个5s滤波初始值平均值                                          
+        }
+        //油量达到高点  
+        if(Oil_Calcu_Average > Oil_Reach_Hih)//寻找最高点
+        {
+            Oil_Reach_Hih =  Oil_Calcu_Average;
+
+            Oil_Temp_Dir |= OIL_SHAKE_UP;
+
+            //if((Oil_Vary_Start > Oil_Reach_Low)&&(8 < (Oil_Vary_Start - Oil_Reach_Low)))
+            if(Oil_Vary_Start - Oil_Reach_Low > 8)//为什么？
+            {
+                Oil_Temp_Dir |= INIT_FLAG;
+            }
+        }
+
+        //每隔一段时间比较一次油位,默认3s
+        if(!(Oil_Run_Cnt % ProductPara.LiquidCmpTc))
+        {
+            Oil_Level_Cnt++;                            //液位比较次数
+            
+            Oil_Vary_Value = L_cyTankOil - g_cyTankOil;//上次减去本次
+            
+            Oil_Vary_Valabs = abs(Oil_Vary_Value);           
+            
+            //油量变化率超过斜率
+            if(((Oil_Vary_Valabs >= UserOilDnOneTime) && (Oil_Vary_Value > 0)) 
+            || ((Oil_Vary_Valabs >= UserOilUpOneTime) && (Oil_Vary_Value < 0)))
+            {
+                //uprintf("Enter Judge\r\n");
+                //Oil_Level_Cnt++;        //液位比较次数
+                //油量下降
+                if(Oil_Vary_Value > 0)
+                {
+                    Oil_Dn_SecCnt++;    //液位下降次数                   
+                    
+                    //是否连续2次液位都下降
+                    if(!(Oil_Level_Dir & OIL_LEVEL_DN_1))//第一次下降置OIL_LEVEL_DN_1
+                    {
+                        Oil_Level_Dir |= OIL_LEVEL_DN_1;
+                        Oil_Last_Status = OIL_LEVEL_DN_1;
+                    }
+                    else
+                    {
+                        Oil_Level_Dir |= OIL_LEVEL_DN_2;//第二次下降置OIL_LEVEL_DN_2
+                        Oil_Last_Status = OIL_LEVEL_DN_2;
+                    }
+                    //大于5L
+                    if(Oil_Vary_Valabs > 50)
+                    {
+                        //向下抖动
+                        Oil_Shake_Dir |= OIL_SHAKE_DN;
+                    }
+                }
+                //油量上升
+                else if(Oil_Vary_Value < 0)
+                {
+                    Oil_Up_SecCnt++;                    //液位上升次数
+
+                    //是否连续2次液位都上升
+                    if(!(Oil_Level_Dir & OIL_LEVEL_UP_1))//第一次上升
+                    {
+                        Oil_Level_Dir |= OIL_LEVEL_UP_1;
+                        Oil_Last_Status = OIL_LEVEL_UP_1;
+                    }
+                    else
+                    {   
+                        Oil_Level_Dir |= OIL_LEVEL_UP_2;//第二次上升
+                        Oil_Last_Status = OIL_LEVEL_UP_2;
+                    }
+                    //大于5L
+                    if(Oil_Vary_Valabs > 50)
+                    {
+                        //向上抖动
+                        Oil_Shake_Dir |= OIL_SHAKE_UP;
+                    }
+                }
+
+                if(Oil_Stable_Cnt)                      //如果在抖动，则平滑计数减1
+                {
+                    Oil_Stable_Cnt--;
+                }
+                if(!Oil_Sub_PreFlag)
+                {
+                    if(RunVar.CarSpeed <= 5)                                    //只判断停止状态下
+                    {
+                        if((Oil_Dn_SecCnt - Oil_Up_SecCnt) * ProductPara.LiquidCmpTc >= 8) //达到一定的降升比(这里15秒连续漏油)，输出临时漏油量
+                        {
+                            if(Oil_Reach_Hih - Oil_Reach_Low >= Oil_DnValue_Min)//大于漏油量阈值，上报
+                            {
+                                Oil_Sub_Output = Oil_Reach_Hih - Oil_Reach_Low;  
+                                
+                                Oil_Sub_PreFlag = 1;                            //上报一次临时漏油量置1，用来只报一次
+                                
+                                if(Oil_Sub_Output > 0x1FFFFFF)                   //防止在车机下发标定数组前上报漏油量
+                                {
+                                    Oil_Sub_Output = 0;
+                                }
+                                else
+                                {
+                                    OilAlarmCnt &= OIL_SUB_MASK;
+                                }
+                                //uprintf("Oil_Sub_PreOutput=%d\r\n",Oil_Sub_PreOutput);
+                            }                        
+                        }
+                    }
+                }
+            }
+            //平衡次数递增
+            else
+            {
+                //Oil_Level_Cnt++;
+                Oil_Blance_Cnt++;
+                Oil_Stable_Cnt++;
+                Oil_Last_Status = 0;
+            }
+            
+            
+            //uprintf("Oil_Up_SecCnt=%d\r\n",Oil_Up_SecCnt);
+            //uprintf("Oil_Dn_SecCnt=%d\r\n",Oil_Dn_SecCnt);
+
+            if(Oil_Level_Cnt >= 2)//液位比较次数为2次
+            {
+                //液位有上有下表现为不规律 判断异常
+                if(Oil_Level_Dir == OIL_LEVEL_UP_DN)    //前后两次一次上一次下
+                {
+                    Oil_Level_Exc++;                    //变化异常
+                }
+                //在这种情况下认为液位较为规律
+                if((Oil_Last_Status == 0) || (Oil_Last_Status == OIL_LEVEL_UP_2) || (Oil_Last_Status == OIL_LEVEL_DN_2))
+                {
+                    Oil_Level_Cnt = 0;
+                    Oil_Level_Dir = 0;
+                }
+                //在液位不规律时进行下一次的捕捉
+                else
+                {
+                    Oil_Level_Cnt = 1;
+                    Oil_Level_Dir = Oil_Last_Status;
+                }
+            }
+
+            //振动发生
+            if(Oil_Shake_Dir == OIL_SHAKE_DN_UP)
+            {
+                //uprintf("Oil_Shake_Dir=%d\r\n\r\n",Oil_Shake_Dir);
+                Oil_Shake_Cnt++;                //抖动次数
+                
+                Oil_Shake_Dir = 0;
+
+                if(Oil_Stable_Cnt)
+                {
+                    Oil_Stable_Cnt--;
+                }
+
+                if(Oil_Up_SecCnt)
+                {
+                    Oil_Up_SecCnt--;
+                }
+
+                if(Oil_Dn_SecCnt)
+                {
+                    Oil_Dn_SecCnt--;
+                }
+            }
+            //将本次油量值覆盖上一次油量值
+            L_cyTankOil = g_cyTankOil;           
+        }
+    }
+    
+    //根据液位状态来判断加漏油结束
+    if(((Oil_Stable_Cnt * ProductPara.LiquidCmpTc) >= OIL_STABLE_MAX) || (Oil_Shake_Cnt >= OIL_SHAKE_MAX))
+    {
+        Oil_Analyze_Start = OIL_ANALYZE_1;
+    }
+    
+    //根据超时来判断结束
+    if(Oil_Run_Cnt >= OIL_RUN_TIMEOUT)  //超时时间5000s
+    {
+        Oil_Analyze_Start = OIL_ANALYZE_2;
+    }
+  
+    Oil_Vary_Valabs = Oil_Reach_Hih - Oil_Reach_Low;
+    
+    //uprintf("Oil_Reach_Hih=%d\r\n",Oil_Reach_Hih);
+    //uprintf("Oil_Reach_Low=%d\r\n",Oil_Reach_Low);
+  
+    if(/*(Oil_Exc_Shake == 0x11) || */(Oil_Level_Exc > OIL_EXCT_MAX))//注释后可以上报加漏油，否则一直报不了
+    {
+        //uprintf("Oil_Exc_Shake=%d\r\n",Oil_Exc_Shake);
+        //uprintf("OIL_EXCT_MAX=%d\r\n",OIL_EXCT_MAX);
+        Oil_Exc_Shake = 0;
+        //油量变化超过报警极限进入加漏油判断
+        if(Oil_Vary_Valabs > ProductPara.Oil_Add_Alarm)
+        {
+            Oil_Analyze_Start = OIL_ANALYZE_3;
+        }
+        else
+        {
+            //uprintf("Oil_Vary_Valabs1=%d\r\n",Oil_Vary_Valabs);
+            Oil_Analyze_Start = INIT_FLAG;
+            //重新开始下一次油量分析
+            Oil_Run_Cnt = 0;
+        }
+    }
+  
+    if(Oil_Temp_Dir > INIT_FLAG)
+    {
+        //uprintf("Oil_Temp_Dir=%d\r\n",Oil_Temp_Dir);
+        Oil_Analyze_Start = INIT_FLAG;
+        //重新开始下一次油量分析
+        Oil_Run_Cnt = 0;
+    }
+  
+    //有加漏油待处理事件
+    if(Oil_Analyze_Start > INIT_FLAG)
+    {
+        //uprintf("Oil_Analyze_Start=%d\r\n",Oil_Analyze_Start);
+        
+        //如果抖动比较大就用油量平均值
+        if(Oil_Shake_Cnt >= OIL_SHAKE_MAX)
+        {
+            Oil_Vary_End = Oil_Calcu_Average;
+        }
+        //否则用油量实时值
+        else
+        {
+            Oil_Vary_End = g_cyTankOil;
+        }
+        //计算出油量高低点的差值
+        Oil_Vary_Valabs = Oil_Reach_Hih - Oil_Reach_Low;     
+        
+         //判断是否符合加油条件
+        if((Oil_Vary_End > Oil_Filter_Start) 
+           && (Oil_Up_SecCnt > Oil_Dn_SecCnt)
+           && ((((Oil_Up_SecCnt - Oil_Dn_SecCnt) * ProductPara.LiquidCmpTc) >= OIL_UPCONTINUETC)
+           || (Oil_Vary_Valabs > ProductPara.Oil_Add_Alarm)))
+        {
+            //uprintf("Add_Oil_OK\r\n"); 
+            
+            //异常情况下二次加油开始点大于加油结束点
+            if(Oil_NextAdd_Start > Oil_Vary_End)
+            {
+                Oil_NextAdd_Start = Oil_Vary_Start;
+            }
+
+            //如果是二次加油
+            if(Oil_NextAdd_Flag > 0)
+            {
+                Oil_Vary_Inc = Oil_Vary_End - Oil_NextAdd_Start;
+            }
+            //如果是一次加油
+            else
+            {
+                Oil_Vary_Inc = Oil_Vary_End - Oil_Vary_Start;
+            }
+
+            //计算出实际的加油斜率
+            Oil_Vary_Rate = (float)Oil_Vary_Inc / (float)(Oil_Run_Cnt - Oil_Blance_Cnt * ProductPara.LiquidCmpTc + 1);
+
+            if(Oil_Vary_Start < Oil_Filter_Start)
+            {
+                Oil_Vary_Inc = Oil_Vary_Inc - (Oil_Filter_Start - Oil_Vary_Start);
+            }
+            else if(Oil_Vary_Start > Oil_Filter_Start)
+            {
+                Oil_Vary_Inc = Oil_Vary_Inc + (Oil_Vary_Start - Oil_Filter_Start);
+            }
+            //uprintf("Oil_Vary_Inc=%d\r\n",Oil_Vary_Inc);
+            
+            //加油超过加油阈值
+            if((Oil_Vary_Rate >= UserOilUpRate) && (RunVar.CarSpeed <= 5))
+            {
+                Oil_Sub_PreFlag = 0;            //加油的时候把漏油临时标志清0一下
+                //标志油量事件
+                OilEventFlag = OIL_EVENT_FLAG;
+                //油量终点值作个记录
+                OilAddEndRecord = Oil_Vary_End;
+            }
+        }
+        
+        //uprintf("Oil_Vary_Start=%d\r\n",Oil_Vary_Start);
+        //uprintf("Oil_Vary_End=%d\r\n",Oil_Vary_End);
+        
+        //判断是否符合漏油条件
+        if((Oil_Vary_Start > Oil_Vary_End)
+           && (Oil_Dn_SecCnt > Oil_Up_SecCnt)
+           && (Oil_Dn_SecCnt / (Oil_Up_SecCnt + 1) > OIL_DNCOMPUP_MAX)
+           && (((Oil_Dn_SecCnt - Oil_Up_SecCnt) * ProductPara.LiquidCmpTc) >= OIL_DNCONTINUETC))
+        {
+            //uprintf("Dec_Oil_OK\r\n");
+            if(Oil_Reach_Hih > Oil_Vary_Start)
+            {
+                Oil_Vary_Start = Oil_Reach_Hih;
+            }
+            Oil_Vary_Sub = Oil_Vary_Start - Oil_Vary_End;
+            
+            //uprintf("Oil_Vary_Sub=%d\r\n",Oil_Vary_Sub);
+            
+            Oil_Vary_Rate = (float)Oil_Vary_Sub / (float)(Oil_Run_Cnt - Oil_Blance_Cnt * ProductPara.LiquidCmpTc + 1);
+            //漏油量超漏油阈值且速度小于5km
+            if((RunVar.FiltSpeed < 5) && (Oil_Vary_Rate > UserOilDnRate))
+            {
+                //标志油量事件
+                OilEventFlag = OIL_EVENT_FLAG;
+            }
+        }
+        //油量分析结束
+        Oil_Analyze_Start = INIT_FLAG;
+        //重新开始下一次油量分析
+        Oil_Run_Cnt = 0;
+        //uprintf("Oil_Analyze_Finished!\r\n");
+    }
+    //油量事件有效
+    if(OilEventFlag == OIL_EVENT_FLAG)
+    {
+        //加油事件(分一次加油和二次加油)
+        if((Oil_Vary_Inc >= ProductPara.RestLiqCnt)
+           && (Oil_NextAdd_Flag > 0x00)
+           || (Oil_Vary_Inc >= Oil_UpValue_Min)
+           && (Oil_NextAdd_Flag < 0x01))
+        {
+            OilEventWaitOut |= OIL_EVENT_WAIT;
+            Oil_NextAdd_Time = 0;
+            Oil_NextAdd_Flag = 1;
+            Oil_Calcu_Inc += Oil_Vary_Inc;
+        }
+        //漏油事件
+        if(Oil_Vary_Sub > Oil_DnValue_Min)
+        {
+            OilEventWaitOut |= OIL_EVENT_WAIT;
+            Oil_Calcu_Sub += Oil_Vary_Sub;
+        }
+
+        Oil_Vary_Inc = 0;
+        Oil_Vary_Sub = 0;
+        //油量事件清零
+        OilEventFlag = 0;
+    }
+  
+    //油量滤波值和油量实时值的绝对值
+    Oil_Vary_Valabs = abs(f_cyTankOil - g_cyTankOil);
+    //uprintf("Oil_Vary_Valabs=%d\r\n",Oil_Vary_Valabs);
+    //uprintf("Oil_Calcu_Sub=%d\r\n",Oil_Calcu_Sub);
+    //滤波值和实时值差别很小的时候或者油量事件输出超时可以输出加漏油量
+    if(((Oil_Vary_Valabs < OIL_VARY_MIN)
+        && ((Oil_Calcu_Inc != 0) || (Oil_Calcu_Sub != 0)))
+        || (OilEventWaitOut > OIL_EVENT_TIMEOUT))
+    {
+        if(Oil_Calcu_Inc != 0)
+        {
+            Oil_Add_Output += Oil_Calcu_Inc;
+                          
+            //uprintf("Oil_Add_Output=%d\r\n",Oil_Add_Output);
+            
+            //防止在车机下发标定数组前上报加油量
+            if(Oil_Add_Output > 0x1FFFFFF)
+            {
+                Oil_Add_Output = 0;
+            }
+            else
+            {
+                if(Oil_Add_Output <= Oil_UpValue_Min)//小于加油量阈值，不报
+                {
+                    Oil_Add_Output = 0;
+                }
+                else
+                {
+                    OilAlarmCnt &= OIL_ADD_MASK;
+                }
+
+            }
+            Oil_Calcu_Inc = 0;
+        }
+        
+        if(Oil_Calcu_Sub != 0)
+        {
+            Oil_Sub_Output += Oil_Calcu_Sub;
+
+            Oil_Sub_PreFlag = 0;                                                //漏油完成，打开临时漏油标志置
+            
+            //uprintf("Oil_Sub_Output=%d\r\n",Oil_Sub_Output);
+            
+            if(Oil_Sub_Output > 0x1FFFFFF)                                      //防止在车机下发标定数组前上报漏油量
+            {
+                Oil_Sub_Output = 0;
+            }
+            else
+            {
+                if(Oil_Sub_Output < Oil_DnValue_Min)
+                {
+                    Oil_Sub_Output = 0;
+                }
+                OilAlarmCnt &= OIL_SUB_MASK;
+            }
+            Oil_Calcu_Sub = 0;
+        }
+        OilEventWaitOut = 0;
+    }
+}
+
+
+
+
+u8 ALGO_BubbleOrderFilter(u32 *pWDataBuf, u8 wLen, u8 wHeadLen, u8 wTailLen, u32 *pAverage)
+{
+  u8 i;
+  u8 j;
+  u32 wTemp;
+  u32 u32FilterBuf[100];
+    
+  if (wLen < (wHeadLen + wTailLen))
+  {
+    return (0);
+  }
+
+  for(i = 0; i < wLen; i++)
+  {
+    u32FilterBuf[i] = *(pWDataBuf + i);
+  }
+  
+  for (i = 0; i < wTailLen; i++)
+  {
+    for (j = 0; j < wLen - i - 1; j++)
+    {
+      if(u32FilterBuf[j] > u32FilterBuf[j + 1])
+      {
+        wTemp = u32FilterBuf[j];
+        u32FilterBuf[j] = u32FilterBuf[j + 1];
+        u32FilterBuf[j + 1] = wTemp;
+      }
+    }
+  }
+
+  for (i = 0; i < wHeadLen; i++)
+  {
+    for (j = wLen - wTailLen - 1; j > i; j--)
+    {
+      if (u32FilterBuf[j - 1] > u32FilterBuf[j])
+      {
+        wTemp = u32FilterBuf[j - 1];
+        u32FilterBuf[j - 1] = u32FilterBuf[j];
+        u32FilterBuf[j] = wTemp;
+      }
+    }
+  }
+    
+  wTemp = 0;
+  for(i = wHeadLen; i < wLen - wTailLen; i++)
+  {
+    wTemp += u32FilterBuf[i];
+  }
+    
+  *pAverage = wTemp/(wLen - wHeadLen - wTailLen);
+    
+  return (1);
+}
+
+
+//电容采样值的滤波，每100ms执行一次，主要作用是获得液位的变化趋势
+void FIFOAndAverage(u32 *rTpCap)
+{
+  u8 cm;
+  u8 tmp[3];
+  s32 PCapValueDif;                                                             //PCap前后差值
+  u32 PCapTempValue;
+  u32 PCapNewValue;
+  
+  static u8 Per100MsCnt;                                                       //100ms计数器
+  static u32 PCapOldValue;                                                     //前1sPCap值
+
+  RunVar.CapFromPCap = RunVar.RawCap;                                           //获得读取的电容值
+  
+  if(RunVar.CapFromPCap > ProductPara.CapMax)                                   //读取的电容值在标定的量程内
+    RunVar.CapFromPCap = ProductPara.CapMax;
+  else if(RunVar.CapFromPCap < ProductPara.CapMin)
+    RunVar.CapFromPCap = ProductPara.CapMin;
+  
+  if(INIT_FLAG != FiltStart)
+  {
+    Per100MsCnt = 0;
+    PCapVarGraphCycle = 0;
+    
+    for(cm = 0; cm < 10; cm++)
+    {
+      PCapVarGraph[cm] = 4;                                                     //数字4代表内容无效
+      PCapRealTimeBuf[cm] = RunVar.CapFromPCap;                                 //全部初始化为初始读到的值
+    }
+    
+    PCapOldValue = RunVar.CapFromPCap;                                          //前1sPCap值
+    *rTpCap = RunVar.CapFromPCap;
+    FiltStart = INIT_FLAG;
+    return ;
+  }
+  
+  PCapRealTimeBuf[Per100MsCnt++] = RunVar.CapFromPCap;
+  
+  PCapTempValue = 0;
+  
+  for(cm = 0; cm < 10; cm++)
+  {
+    PCapTempValue += PCapRealTimeBuf[cm];
+  }
+  PCapNewValue = PCapTempValue / 10;                                            //每10个PCap作平均滤波
+  
+  if(CNT_MAX < Per100MsCnt)                                                     //1S
+  {
+    OilFresh1s = 1;
+    Per100MsCnt = 0;
+    PCapValueDif = PCapNewValue - PCapOldValue;                                 //每1s时间PCap值作差值
+    
+    for(cm = 9; cm > 0; cm--)
+    {
+      PCapVarGraph[cm] = PCapVarGraph[cm - 1];                                  //PCap值走势作移位更新
+    }
+    
+    if(150 > labs(PCapValueDif))                                                //PCap前后差值小于150视为平稳
+    {
+      PCapVarGraph[0] = 0;                                                      //平稳则变化曲线点置0
+    }
+    else
+    {
+      if(0 > PCapValueDif)                                                      //PCap值呈下降趋势
+      {
+        PCapVarGraph[0] = 1;
+      }
+      else
+      {
+        PCapVarGraph[0] = 2;                                                    //PCap值呈上升趋势
+      }
+    }
+    
+    PCapVarGraphCycle++;
+    PCapOldValue = PCapNewValue;                        //新值变为旧值
+    
+    if(0x09 < (PCapVarGraphCycle&0x7F))                                         //PCap走势提取完成
+    {
+      PCapVarGraphCycle &= 0x80;                        //提取完成后bit7置位，留下提取完成标志
+      PCapVarGraphCycle |= 0x80;
+    }
+    
+    if(0 != (PCapVarGraphCycle&0x80))                                           //PCap走势内容分析
+    {
+      tmp[0] = 0;
+      tmp[1] = 0;
+      tmp[2] = 0;
+    
+      for(cm = 0; cm < 10; cm++)                        //计算趋势曲线的变化点个数
+      {
+        if(0 == PCapVarGraph[cm])
+        {
+          tmp[0]++;                                     //平稳点个数
+        }
+        else if(1 == PCapVarGraph[cm])
+        {
+          tmp[1]++;                                     //下降点个数
+        }
+        else
+        {
+          tmp[2]++;                                     //上升点个数
+        }
+      }
+    
+      if(9 < tmp[0])                                                            //10s内都是平稳的
+      {
+        if(255 > PCapStableCnt[0])
+        {
+          PCapStableCnt[0]++;                                                   //PCap平稳计数器递增
+        }
+        PCapStableCnt[1] = 0;                                                   //下降和上升计数器清0
+        PCapStableCnt[2] = 0;
+      }
+      else if(9 < tmp[1])
+      {
+        if(255 > PCapStableCnt[1])
+        {
+          PCapStableCnt[1]++;                                                   //PCap上升计数器递增
+        }
+        PCapStableCnt[0] = 0;
+        PCapStableCnt[2] = 0;
+      }
+      else if(9 < tmp[2])
+      {
+        if(255 > PCapStableCnt[2])
+        {
+          PCapStableCnt[2]++;                                                   //PCap下降计数器递增
+        }
+        PCapStableCnt[0] = 0;
+        PCapStableCnt[1] = 0;
+      }
+      else
+      {
+        PCapStableCnt[0] = 0;
+        PCapStableCnt[1] = 0;
+        PCapStableCnt[2] = 0;
+      }
+    }
+  }
+  *rTpCap = PCapNewValue;
+}
+
+
+
+//平滑滤波
+void LiquidHeightSmoothOrStable(void)
+{
+    u8 cnt,di;
+    u8 freshsta;
+    u16 PCapVarSta;
+    s32 FilterCapDif;
+    s32 FilterCapDifdiv;
+    u32 FilterInputValue;
+    u32 FilterCapSumValue;
+    static u8 SmoothFlag;
+    static u16 PCapUpdateCnt;
+
+    if(INIT_FLAG != SmoothFlag)
+    {
+        FilterFresh1s = 0;
+        f_cyTankOil = g_cyTankOil;          //滤波油量初始化为实时油量
+        FilterCapValue = RealTimeCapValue;  //滤波电容值初始化为每秒的电容值
+        RunVar.LiquidHeight[1] = RunVar.LiquidHeight[0];
+        RunVar.LiquidHeightRate[1] = RunVar.LiquidHeightRate[0];
+        RunVar.LiquidHeightValue[1] = RunVar.LiquidHeightValue[0];
+        for(cnt = 0; cnt < 150; cnt++)
+        {
+            PCapStableBuf[cnt] = RealTimeCapValue;//实时电容值
+        }
+        SmoothFlag = INIT_FLAG;
+        return ;
+    }
+  
+    FilterFresh1s++;
+  
+    if(FilterFresh1s > 9)               //1s时间到
+    {
+        FilterFresh1s = 0;
+        /*
+        //ACC状态关闭
+        if(RunVar.AccStatus == ACC_OFF)
+        {
+            AccFlag |= ACC_OFF;
+            
+            if(AccFlag > ACC_ON)
+            {
+                AccFlag |= INIT_FLAG;                                           //ACC状态有效
+            }
+        }
+        //ACC状态打开
+        if(ACC_ON == RunVar.AccStatus)
+        {
+            AccFlag |= ACC_ON;
+        }
+*/
+        PCapVarSta = PCapStableCnt[0] + PCapStableCnt[1] + PCapStableCnt[2];
+        //连续长时间处于某种单调状态则加快滤波数据更新
+        if((11 < PCapVarSta)&&(0 != (PCapVarGraphCycle&0x80)))//11个变化周期
+        {
+            if(PCapVarSta == PCapStableCnt[0])//连续平稳
+            {
+                PCapUpdateCnt += 15;            //更新值加15        
+            }
+            else if((PCapVarSta == PCapStableCnt[1]) || (PCapVarSta == PCapStableCnt[2]))//连续上升或下降单调
+            {
+                PCapUpdateCnt += 10;            //更新值加10
+            }
+            else                              //不单调
+            {
+                PCapUpdateCnt = 1;              //更新值=1
+            }
+        }
+        else        //小于11个变化周期
+        {
+            if(OilEventWaitOut < OIL_EVENT_WAIT)//没有加漏油事件
+            {
+                PCapUpdateCnt = 2;              //更新值为2
+            }
+        }
+        //此时有加漏油事件就加快滤波数组更新速度
+        if(OIL_EVENT_WAIT <= OilEventWaitOut)
+        {
+            //freshsta = 30;
+            //PCapUpdateCnt += 40;
+            for(di = 0; di < 150; di++)
+            {
+                PCapStableBuf[di] = RealTimeCapValue;
+            }
+        }
+        //ACC关闭或者速度为0加快更新
+        else if((ACC_OFF == RunVar.AccStatus) || (RunVar.CarSpeed < 1))
+        //else if(((INIT_FLAG < AccFlag)&&(ACC_OFF == RunVar.AccStatus)) || ((INIT_FLAG > AccFlag)&&(1 > RunVar.CarSpeed)))
+        {
+            freshsta = 20;
+            if(12 < PCapStableCnt[0])
+            {
+                PCapUpdateCnt += 15;
+            }
+            else
+            {
+                PCapUpdateCnt += 2;
+            }
+        }
+        else
+        {
+            freshsta = 1;
+        }
+        //将滤波因子控制在滤波周期内
+        if(UserParam.FilterCycle < PCapUpdateCnt)
+        {
+            PCapUpdateCnt = UserParam.FilterCycle;
+        }
+        //PCap前后差值
+        FilterCapDif = PCapStableBuf[0] - RealTimeCapValue;
+        //PCap滤波行进量
+        FilterCapDifdiv = FilterCapDif / (UserParam.FilterCycle - PCapUpdateCnt + 1);
+        //PCap变化量小于滤波最小变化量就直接给实时值
+        if((16000 / UserParam.FilterCycle) > labs(FilterCapDif))
+        {
+            FilterInputValue = RealTimeCapValue;
+        }
+        //依照滤波行进量进行滤波
+        else
+        {
+            FilterInputValue = PCapStableBuf[0] - FilterCapDifdiv;
+        }
+        //将指定数组范围使用递推刷新
+        for(di = 149; di > (freshsta - 1); di--)
+        {
+            PCapStableBuf[di] = PCapStableBuf[di - freshsta];
+        }
+        //用当前滤波输入值覆盖剩余未刷新滤波数组
+        for(di = 0; di < freshsta; di++)
+        {
+            PCapStableBuf[di] = FilterInputValue;
+        }
+
+        FilterCapSumValue = 0;
+        //平滑滤波
+        if(1 >= UserParam.FilterLevel)
+        {
+            for(di = 0; di < 100; di++)
+            {
+                FilterCapSumValue += PCapStableBuf[di];
+            }
+            FilterCapSumValue /= 100;
+        }
+        //平稳滤波 数组变长
+        else
+        {
+            for(di = 0; di < 150; di++)
+            {
+                FilterCapSumValue += PCapStableBuf[di];
+            }
+            FilterCapSumValue /= 150;
+        }
+
+        if(1 == ProductPara.CompenEn)
+        {
+            FilterCapValue = (u32)(FilterCapSumValue * UserParam.UserFlowK + UserParam.UserFlowB*100 - 100);
+        }
+        else
+        {
+            FilterCapValue = FilterCapSumValue;
+        }
+
+        RunVar.LiquidHeightRate[1] = (float)(FilterCapValue - ProductPara.CapMin)/(float)CapRange;
+        if(1.0 <= RunVar.LiquidHeightRate[1])
+        {
+            RunVar.LiquidHeightRate[1] = 1.0;
+        }
+        RunVar.LiquidHeight[1] = (u32)(RunVar.LiquidHeightRate[1] * 65535);
+        //盲区固定33mm 油箱厚度固定20mm
+        RunVar.LiquidHeightValue[1] = (u32)(RunVar.LiquidHeightRate[1] * (g_cyRange - 330) + ProductPara.BoxPara[2]*10 - g_cyRange + 200); // 液位高度
+        f_cyTankOil = Get_TankOil(RunVar.LiquidHeightValue[1]);
+    }
+}
+
+
+
+
+EverySecFilTypeDef SecFilStr;
+
+FlagStatus Get_EverySecPcap(void)                                              //获得每秒的电容值
+{
+    u8 i;
+    
+    RunVar.CapFromPCap = RunVar.RawCap;                                         //获得读取的电容值
+  
+    if(RunVar.CapFromPCap > ProductPara.CapMax)                                 //读取的电容值在标定的量程内
+    {
+        RunVar.CapFromPCap = ProductPara.CapMax;
+    }
+    else if(RunVar.CapFromPCap < ProductPara.CapMin)
+    {
+        RunVar.CapFromPCap = ProductPara.CapMin;  
+    }
+    if(SecFilStr.FilterStart == Bit_RESET)                                      //初始状态填满数组                                   
+    {
+        SecFilStr.Ms100_Cycle = 0;
+        SecFilStr.EverySecCap = 0;
+        for(i = 0; i < sizeof(SecFilStr.FilArray)/sizeof(SecFilStr.FilArray[0]); i++)
+        {
+            SecFilStr.FilArray[i] = RunVar.CapFromPCap;
+        }
+        for(i = 0; i < sizeof(UserParam.HFil)/sizeof(UserParam.HFil[0]); i++)
+        {
+            UserParam.HFil[i] = RunVar.CapFromPCap;
+        }
+        for(i = 0; i < sizeof(UserParam.LFil)/sizeof(UserParam.LFil[0]); i++)
+        {
+            UserParam.LFil[i] = RunVar.CapFromPCap;
+        }
+        UserParam.PCap_Filter = RunVar.CapFromPCap;
+        SecFilStr.FilterStart = Bit_SET;
+        return RESET;
+    }
+    SecFilStr.FilArray[SecFilStr.Ms100_Cycle++] = RunVar.CapFromPCap;           //填数组
+    if(SecFilStr.Ms100_Cycle >= 10)                                             //填满了，去头尾求均值
+    {
+        SecFilStr.EverySecCap = GetDelExtremeAndAverage(SecFilStr.FilArray,SecFilStr.Ms100_Cycle,SecFilStr.Ms100_Cycle/3,SecFilStr.Ms100_Cycle/3);
+        SecFilStr.Ms100_Cycle = 0;
+        return SET;                                                            //获得每秒的电容值
+    }
+    return RESET;
+}
+
+
+float Add_Thr;
+float Lea_Thr;
+
+
+void Get_Add_Leak_Thr(void)
+{
+    Add_Thr = ProductPara.AddLiqCnt * 1.0/ ProductPara.AddLiqTime;
+    Lea_Thr = Oil_DnValue_Min * 1.0 / ProductPara.SubLiqTime;
+}
+
+
+
+
+#include "string.h"
+#define FILTER_LEN      3
+int xAxis[FILTER_LEN]={0,1,2};                         //每秒X轴的值，间隔相同，所以取间隔相同的数据作为X轴值就可以了
+//int kxAis[FILTER_LEN]={0,3,6};                         //斜率的X轴值，每隔3秒一个数据                        
+int yAxis[FILTER_LEN];                                 //AD值Y轴数据
+
+u32 StartAD[FILTER_LEN*10];                             //计算加漏油起始值数组
+//u16 EndAD[FILTER_LEN*10];                               //计算加漏油结束值数组
+BitAction InitArrayFlag = Bit_RESET;                    //初始化数组标志
+//BitAction StartFlag = Bit_RESET; 
+u8 UpCnt,DoCnt,WaCnt,TimeCnt;
+u32 MinAd,MaxAd;
+
+typedef enum
+{
+    IDLE = 0,
+    ADD,
+    SUB
+}OilTypedef;
+
+
+typedef enum
+{
+    START = 0,
+    STOP,
+}
+
+
+OilTypedef OilState;
+
+void Judge_Add_Leak_Oil(u32 SecPCap)
+{
+    u8 i;
+    u16 RealADValue,ADValue;
+    u32 RealSecPCap;
+    float Rate;
+    int yK;
+    
+    if(ProductPara.CompenEn == 1)
+    {                                   //获得每秒补偿的电容值
+        RealSecPCap = (u32)(SecPCap * UserParam.UserFlowK + UserParam.UserFlowB*100 - 100);
+    }
+    else
+    {
+        RealSecPCap = SecPCap;          //不补偿的电容值
+    }
+                                        //计算液位占满量程的百分比
+    Rate = (float)(RealSecPCap - ProductPara.CapMin) / ProductPara.CapRange;
+    if(Rate > 1.0f)
+    {
+        Rate = 1.0f;
+    }
+    RealADValue = (u32)(Rate * 65535);
+    ADValue = (u32)(Rate * ProductPara.Range);       //油杆量程作为AD的基准值(量程单位0.1mm)
+    uprintf("ADvalue=%d\r\n",ADValue);
+    if(InitArrayFlag == Bit_RESET)
+    {
+        InitArrayFlag = Bit_SET;
+        for(i = 0; i < FILTER_LEN; i++)
+        {
+            yAxis[i] = ADValue;
+        }
+        for(i = 0; i < FILTER_LEN * 10; i++)
+        {
+            StartAD[i] = ADValue;
+        }
+    }
+    if(OilState == IDLE)                                               //没有加漏油油时更新开始数组，有时停止更新
+    {
+        memcpy((u8*)StartAD, (u8*)(StartAD+1), (FILTER_LEN*2-1)*2);
+        *(StartAD+FILTER_LEN*2-1) = RealADValue;      
+    }
+    memcpy((u8*)yAxis, (u8*)(yAxis+1), (FILTER_LEN-1)*4);
+    *(yAxis+FILTER_LEN-1) = ADValue;                                            //FIFO更新Y轴AD数据   
+    yK = get_slop(xAxis, yAxis, FILTER_LEN);                                    //最小二乘法计算三个值的斜率（即每秒液位升高的高度*1000mm） 
+    if(++TimeCnt <= 10)                                                         //10秒内
+    {
+        if((yK > 0) && (yK > (u32)ProductPara.AddMapHeight))                    //斜率大于0且大于阈值斜率
+        {
+            UpCnt++;                                                            //液位上升次数+1
+        }
+        else if((yK < 0) && (abs(yK) > (u32)ProductPara.SubMapHeight))
+        {
+            DoCnt++;
+        }
+        else                                                                   //液位下降次数+1
+        {
+            WaCnt++;                                                            //波动次数                
+        }
+    }
+    if(TimeCnt == 10)                                                           //10秒一个周期
+    {
+        TimeCnt = 0;
+        if(UpCnt >= 3 * (DoCnt + WaCnt))                                        
+        {
+            OilState = ADD;                                                     //正在加油
+            MinAd = GetDelExtremeAndAverage(StartAD,FILTER_LEN*10,FILTER_LEN*10/3,FILTER_LEN*10/2);
+            uprintf("MinAd=%d\r\n",MinAd);
+        }
+        else if(DoCnt >= 3 * (UpCnt + WaCnt))
+        {
+            OilState = SUB;                                                     //正在漏油
+        }
+        else
+        {           
+            OilState = IDLE;                                                    //加漏油结束或是只是在震荡
+            //MaxAd = RealADValue;
+            //uprintf("MaxAd=%d\r\n",MaxAd);
+            //uprintf("MaxAd-MinAD=%d\r\n",MaxAd-MinAd);
+        }
+        UpCnt = DoCnt = WaCnt = 0;                                              //清0
+        if(OilState!=ADD)
+        {
+            MaxAd = RealADValue;
+            uprintf("MaxAd=%d\r\n",MaxAd);
+            uprintf("MaxAd-MinAD=%d\r\n",MaxAd-MinAd);
+        }
+    }   
+    uprintf("yK=%d\r\n",yK);
+    //uprintf("AddMap=%f\r\n",ProductPara.AddMapHeight);
+
+}
+
+
+
+
+
+
+void Get_Filter_PCap(void)
+{
+    static u8 LFilCnt = 0;
+    
+    if(Get_EverySecPcap())                                                      //得到每秒数据
+    {
+        if(UserParam.FilterLevel == 1)                                          //实时滤波
+        {
+            UserParam.PCap_Filter = SecFilStr.EverySecCap;                      //滤波值即为每秒的值
+        }
+        else                                                                   //平滑和平稳滤波
+        {                                                                       //低滤波值向左FIFO
+            memcpy((u8*)UserParam.LFil, (u8*)(UserParam.LFil+1), (UserParam.FilterBufMax-1)*4);
+            *(UserParam.LFil+UserParam.FilterBufMax-1) = SecFilStr.EverySecCap; //当前值放入队尾 
+            if(++LFilCnt >= UserParam.FilterBufMax)                             //低滤波数组填满
+            {
+                LFilCnt = 0;
+                memcpy((u8*)UserParam.LFilBak, (u8*)UserParam.LFil, UserParam.FilterBufMax*4);//低滤波值放入备份数组
+                memcpy((u8*)UserParam.HFil, (u8*)(UserParam.HFil+1), 32);       //高滤波值向左FIFO    新值放入队尾
+                *(UserParam.HFil+9) = GetDelExtremeAndAverage(UserParam.LFilBak,UserParam.FilterBufMax,UserParam.FilterBufMax/3,UserParam.FilterBufMax/3);
+                memcpy((u8*)UserParam.HFilBak, (u8*)UserParam.HFil, 40);        //放入备份数组
+                UserParam.PCap_Filter = GetDelExtremeAndAverage(UserParam.HFilBak,10,3,3);
+            }
+        }       
+        Judge_Add_Leak_Oil( SecFilStr.EverySecCap);
+    }
+}
+
+
+
+
+
+
+
+
+
+
+void App_Filter_Task (void *p_arg)
+{
+    OS_ERR Err; 
+    //u32 rtfTemp;
+    //float smfTemp;
+    //float stfTemp;
+    BitAction bNeetResetPcap = Bit_RESET;
+    Capture_TimerInit();
+    DA_Init();
+    //Pcap_INTN();
+    while(1)
+    {
+#if IWDG_EN > 0
+        IWDG_ReloadCounter();
+#endif
+        OSTaskSemPend(0, OS_OPT_PEND_BLOCKING, NULL, &Err);
+        if (Err == OS_ERR_NONE)
+        {
+            bNeetResetPcap = IsNeetResetPcap();//是否需要重启PCap
+            
+            if(Bit_SET == bNeetResetPcap)
+            {
+                bNeetResetPcap = Bit_RESET;
+                resetPcap();                    //重启
+                RunVar_Init();
+                Capture_TimerInit();
+                continue;
+            }
+            Get_Filter_PCap();
+            /*FIFOAndAverage(&rtfTemp);           //获得液位的变化趋势(实际是得到每秒的Pcap平均值)
+            
+            if(1 == ProductPara.CompenEn)
+            {                                   //获得每秒的电容值
+              RealTimeCapValue = (u32)(rtfTemp * UserParam.UserFlowK + UserParam.UserFlowB*100 - 100);
+            }
+            else
+            {
+              RealTimeCapValue = rtfTemp;
+            }
+                                                //计算液位占满量程的百分比
+            RunVar.LiquidHeightRate[0] = (float)(RealTimeCapValue - ProductPara.CapMin)/(float)CapRange;
+            if(1.0 <= RunVar.LiquidHeightRate[0])
+            {
+              RunVar.LiquidHeightRate[0] = 1.0;
+            }
+            RunVar.LiquidHeight[0] = (u32)(RunVar.LiquidHeightRate[0] * 65535);
+            //盲区固定33mm 油箱厚度固定20mm
+            RunVar.LiquidHeightValue[0] = (u32)(RunVar.LiquidHeightRate[0] * (g_cyRange - 330) + ProductPara.BoxPara[2]*10 - g_cyRange + 200);
+            
+            g_cyTankOil = Get_TankOil(RunVar.LiquidHeightValue[0]);//根据标定的数组和Pcap值获得实时油量
+            
+             LiquidHeightSmoothOrStable();
+             
+             if(0 != RunVar.OilInit)
+             {
+               if(1 == OilFresh1s)
+               {
+                 OilFresh1s = 0;
+                 LiquidVariaAnalysis();
+               }
+             }
+             else
+             {
+               Oil_Analyze_Start = 0;
+               Oil_Calcu_Inc = 0;
+               Oil_Calcu_Sub = 0;
+             }
+             
+            if(ProductPara.LiquitHeightforDAMax > 0.1)
+            {
+                if(RunVar.LiquidHeight[1] >= ProductPara.LiquitHeightforDAMax)
+                {
+                    smfTemp = 1.0;
+                }
+                else
+                {
+                    smfTemp = RunVar.LiquidHeight[1] / ProductPara.LiquitHeightforDAMax;
+                }
+            }
+            else
+            {
+                smfTemp = RunVar.LiquidHeightRate[1];
+            }
+
+            RunVar.DAForFloater = CalcuFloaterDACode((u16)(smfTemp * 100.0), &ProductPara.Floater);
+            
+            RunVar.DAForFloater = DAOutPutStabilised((u16)(smfTemp * 100.0), RunVar.DAForFloater);
+            
+            if(Bit_RESET == DAOilDebug.bDADebugEn)
+            {
+                DA_Write(RunVar.DAForFloater);
+            }
+            if(Bit_RESET == DAOutDebug.bDADebugEn)
+            {
+                DA2_Write((u16)(RunVar.LiquidHeightRate[1] * (ProductPara.DAMax - ProductPara.DAMin) + ProductPara.DAMin));
+            }*/
+        }
+    }
+}
+
